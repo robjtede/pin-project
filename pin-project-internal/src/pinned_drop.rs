@@ -4,8 +4,8 @@ use proc_macro2::{Span, TokenStream};
 use quote::{ToTokens as _, format_ident, quote};
 use syn::{
     Error, FnArg, GenericArgument, Ident, ImplItem, ItemImpl, Pat, PatIdent, PatType, Path,
-    PathArguments, Result, ReturnType, Signature, Token, Type, TypePath, TypeReference,
-    parse_quote, spanned::Spanned as _, token::Colon, visit_mut::VisitMut as _,
+    PathArguments, ReceiverKind, Result, ReturnType, Safety, Signature, Token, Type, TypePath,
+    TypeReference, parse_quote, spanned::Spanned as _, visit_mut::VisitMut as _,
 };
 
 use crate::utils::{ReplaceReceiver, SliceExt as _};
@@ -60,7 +60,7 @@ fn validate_impl(item: &ItemImpl) -> Result<()> {
         bail!(attr, "duplicate #[pinned_drop] attribute");
     }
 
-    if let Some((_, path, _)) = &item.trait_ {
+    if let Some((path, _)) = &item.trait_ {
         if !path.is_ident("PinnedDrop") {
             bail!(path, INVALID_ITEM);
         }
@@ -102,7 +102,7 @@ fn validate_impl(item: &ItemImpl) -> Result<()> {
 /// The correct signature is: `(mut) self: (<path>::)Pin<&mut Self>`
 fn validate_sig(sig: &Signature) -> Result<()> {
     fn get_ty_path(ty: &Type) -> Option<&Path> {
-        if let Type::Path(TypePath { qself: None, path }) = ty { Some(path) } else { None }
+        if let Type::Path(TypePath { qself: None, path, .. }) = ty { Some(path) } else { None }
     }
 
     const INVALID_ARGUMENT: &str = "method `drop` must take an argument `self: Pin<&mut Self>`";
@@ -126,7 +126,11 @@ fn validate_sig(sig: &Signature) -> Result<()> {
 
     if let Some(arg) = sig.receiver() {
         // (mut) self: <path>
-        if let Some(path) = get_ty_path(&arg.ty) {
+        let ReceiverKind::Typed(_, ty) = &arg.kind else {
+            bail!(arg, INVALID_ARGUMENT);
+        };
+
+        if let Some(path) = get_ty_path(ty) {
             let ty =
                 path.segments.last().expect("type paths should always have at least one segment");
             if let PathArguments::AngleBracketed(args) = &ty.arguments {
@@ -142,8 +146,8 @@ fn validate_sig(sig: &Signature) -> Result<()> {
                         && ty.ident == "Pin"
                         && get_ty_path(elem).is_some_and(|path| path.is_ident("Self"))
                     {
-                        if sig.unsafety.is_some() {
-                            bail!(sig.unsafety, "implementing the method `drop` is not unsafe");
+                        if let Safety::Unsafe(unsafety) = &sig.safety {
+                            bail!(unsafety, "implementing the method `drop` is not unsafe");
                         }
                         return Ok(());
                     }
@@ -175,7 +179,7 @@ fn expand_impl(item: &mut ItemImpl) {
     // `PinnedDrop` is a private trait and should not appear in docs.
     item.attrs.push(parse_quote!(#[doc(hidden)]));
 
-    let path = &mut item.trait_.as_mut().expect("unexpected inherent impl").1;
+    let path = &mut item.trait_.as_mut().expect("unexpected inherent impl").0;
     *path = parse_quote_spanned! { Span::call_site().located_at(path.span()) =>
         ::pin_project::__private::PinnedDrop
     };
@@ -191,6 +195,8 @@ fn expand_impl(item: &mut ItemImpl) {
         drop_inner.sig.ident = ident;
         drop_inner.sig.generics = item.generics.clone();
         let receiver = drop_inner.sig.receiver().expect("drop() should have a receiver").clone();
+        let ReceiverKind::Typed(colon_token, ty) = receiver.kind else { unreachable!() };
+
         let pat = Box::new(Pat::Ident(PatIdent {
             attrs: vec![],
             by_ref: None,
@@ -198,12 +204,8 @@ fn expand_impl(item: &mut ItemImpl) {
             ident: Ident::new("__self", receiver.self_token.span()),
             subpat: None,
         }));
-        drop_inner.sig.inputs[0] = FnArg::Typed(PatType {
-            attrs: receiver.attrs,
-            pat,
-            colon_token: Colon::default(),
-            ty: receiver.ty,
-        });
+        drop_inner.sig.inputs[0] =
+            FnArg::Typed(PatType { attrs: receiver.attrs, pat, colon_token, ty });
         let Type::Path(self_ty) = &*item.self_ty else { unreachable!() };
         let mut visitor = ReplaceReceiver(self_ty);
         visitor.visit_signature_mut(&mut drop_inner.sig);
@@ -212,7 +214,7 @@ fn expand_impl(item: &mut ItemImpl) {
     };
 
     // `fn drop(mut self: Pin<&mut Self>)` -> `unsafe fn drop(self: Pin<&mut Self>)`
-    method.sig.unsafety = Some(<Token![unsafe]>::default());
+    method.sig.safety = Safety::Unsafe(<Token![unsafe]>::default());
     let self_token = if let FnArg::Receiver(ref mut rec) = method.sig.inputs[0] {
         rec.mutability = None;
         &rec.self_token
