@@ -4,7 +4,7 @@
 
 use proc_macro::TokenStream;
 use quote::{ToTokens as _, format_ident, quote};
-use syn::{Field, FieldMutability, Fields, ItemStruct, Token, Visibility, parse_quote};
+use syn::{Field, FieldModifiers, Fields, ItemStruct, Token, Visibility, parse_quote};
 
 fn tokens2(tokens: TokenStream) -> proc_macro2::TokenStream {
     tokens.into()
@@ -52,7 +52,8 @@ pub fn add_pinned_field(_: TokenStream, input: TokenStream) -> TokenStream {
         ident: Some(format_ident!("__field")),
         colon_token: Some(<Token![:]>::default()),
         ty: parse_quote!(::std::marker::PhantomPinned),
-        mutability: FieldMutability::None,
+        modifiers: FieldModifiers::default(),
+        default: None,
     });
 
     item.into_token_stream().into()
